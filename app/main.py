@@ -15,6 +15,8 @@ API:
   POST /api/plans/{id}/water-delivery
                                     可行方案的应急送水分配预览(只读计算)
   POST /api/plans/{id}/spare-parts  可行方案的关阀作业备件包采购预览(只读计算)
+  POST /api/plans/{id}/capacity-check
+                                    可行方案的供水容量校核(只读计算)
   POST /api/demo                    恢复内置示例管网
   POST /api/clear                   清空管网输入
 """
@@ -32,10 +34,10 @@ from pydantic import BaseModel, Field, field_validator
 
 import database
 from demo import DEMO_NETWORK
-from solver import (MAX_VALVES, NetworkValidationError, plan_jumpers,
-                    plan_monitors, plan_sequence, plan_spare_parts,
-                    plan_water_delivery, solve, solve_failover, solve_siting,
-                    solve_tradeoff)
+from solver import (MAX_VALVES, NetworkValidationError, plan_capacity_check,
+                    plan_jumpers, plan_monitors, plan_sequence,
+                    plan_spare_parts, plan_water_delivery, solve,
+                    solve_failover, solve_siting, solve_tradeoff)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -182,6 +184,18 @@ class SparePartsIn(BaseModel):
     """
     valve_demands: dict[str, Any] = Field(default_factory=dict)
     packages: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class CapacityCheckIn(BaseModel):
+    """供水容量校核录入: 未关阀管段流量上限 + 进水点供给上限 + 必保点需求。
+
+    三类键都必须与方案快照完整对应(未关阀管段/进水点/必保点各自恰好
+    对应), 值均为正整数; 逐条校验在 solver.plan_capacity_check 中进行,
+    以便返回明确错误。
+    """
+    segment_capacities: dict[str, Any] = Field(default_factory=dict)
+    inlet_supplies: dict[str, Any] = Field(default_factory=dict)
+    keep_demands: dict[str, Any] = Field(default_factory=dict)
 
 
 @asynccontextmanager
@@ -468,6 +482,41 @@ def plan_spare_parts_preview(plan_id: int, req: SparePartsIn) -> dict:
                                   plan.get("closed_valves", []),
                                   req.valve_demands,
                                   req.packages)
+    except NetworkValidationError as exc:
+        raise HTTPException(status_code=422, detail={"errors": exc.errors})
+    result["plan_id"] = plan_id
+    result["solver"] = plan.get("solver", "base")
+    return result
+
+
+@app.post("/api/plans/{plan_id}/capacity-check")
+def plan_capacity_check_preview(plan_id: int, req: CapacityCheckIn) -> dict:
+    """已保存可行方案的供水容量校核(独立 API, 只读计算)。
+
+    以方案快照中未关阀管段构成无向输水网, 录入每条未关阀管段的正整数
+    流量上限(管段净流量的绝对值受同一上限约束)、每个进水点的正整数供给
+    上限、每个必保供水点的正整数需求; 通过整数最大流求可送达必保点的
+    最大总量, 返回需求总量、最大送达量、总缺口与各必保点实际送达量;
+    总送达量等于总需求才标记容量充足(仅连通但容量不足显示不足), 无
+    必保点时返回充足及零需求。不修改管网与历史方案。
+    """
+    with database.get_conn() as conn:
+        plan = database.get_plan(conn, plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="方案不存在")
+    if not plan.get("feasible"):
+        reason = plan.get("reason_code")
+        raise HTTPException(status_code=422, detail={"errors": [
+            f"方案 #{plan_id} 为不可行方案"
+            + (f"(reason_code: {reason})" if reason else "")
+            + ", 没有关阀后管网快照, 不能进行供水容量校核"
+        ]})
+    try:
+        result = plan_capacity_check(plan["network_snapshot"],
+                                     plan.get("closed_valves", []),
+                                     req.segment_capacities,
+                                     req.inlet_supplies,
+                                     req.keep_demands)
     except NetworkValidationError as exc:
         raise HTTPException(status_code=422, detail={"errors": exc.errors})
     result["plan_id"] = plan_id

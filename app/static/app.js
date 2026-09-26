@@ -338,6 +338,7 @@ function renderResult(r) {
     appendMonitorPanel(r);
     appendWaterDeliveryPanel(r);
     appendSparePartsPanel(r);
+    appendCapacityPanel(r);
     drawCanvas();
     return;
   }
@@ -367,6 +368,7 @@ function renderResult(r) {
   appendMonitorPanel(r);
   appendWaterDeliveryPanel(r);
   appendSparePartsPanel(r);
+  appendCapacityPanel(r);
   drawCanvas();
 }
 
@@ -1548,6 +1550,151 @@ function renderSparePartsResult(res, box) {
     <p class="role-name">合计: 需求 ${res.total_demand} 件, 到货
     ${res.arrived_total} 件, 余量 <b>${res.surplus_total}</b> 件,
     总价 <b>${res.total_cost}</b>。</p>`;
+}
+
+// ---------- 供水容量校核 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的校核卡片。
+// 只读计算, 不修改管网与历史方案。
+function appendCapacityPanel(r) {
+  if (r.id == null) return; // 未入库结果不提供校核入口
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "capacity-card";
+
+  // 无向输水网 = 方案快照中未关阀管段(含停水管段)
+  const openSegs = (r.segment_status || []).filter((s) => s.status !== "closed");
+  const inlets = (r.node_status || []).filter((n) => n.role === "inlet");
+  const keeps = (r.node_status || []).filter((n) => n.role === "must_keep");
+
+  if (!keeps.length) {
+    card.innerHTML = `
+      <h3>供水容量校核</h3>
+      <p class="role-name">方案快照中没有必保供水点, 需求总量为 0,
+      容量校核直接判定充足(零需求), 无需录入。</p>`;
+    body.appendChild(card);
+    return;
+  }
+
+  card.innerHTML = `
+    <h3>供水容量校核 <span class="role-name">(只读计算, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      以方案快照中<b>未关阀管段</b>构成无向输水网: 逐条录入<b>正整数流量上限</b>
+      (管段净流量的绝对值受同一上限约束), 为每个<b>进水点</b>录入<b>正整数供给上限</b>,
+      为每个<b>必保供水点</b>录入<b>正整数需求</b>。系统用<b>整数最大流</b>求可送达
+      必保点的最大总量; <b>总送达量等于总需求才判定容量充足</b>, 仅连通但容量不足
+      显示不足。
+    </p>
+    <h4>未关阀管段流量上限（${openSegs.length} 条）</h4>
+    <table id="table-capacity-segments"><thead><tr>
+      <th>管段</th><th>端点</th><th>状态</th><th>流量上限（正整数）</th>
+    </tr></thead><tbody>
+      ${openSegs.map((s) => `<tr>
+        <td><b>${esc(s.id)}</b></td>
+        <td>${esc(s.endpoint_a)} — ${esc(s.endpoint_b)}</td>
+        <td><span class="tag ${s.status}">${STATUS_TEXT[s.status]}</span></td>
+        <td><input data-cap="${esc(s.id)}" type="number" min="1" step="1" value="1"></td>
+      </tr>`).join("")}
+    </tbody></table>
+    <div class="grid-two">
+      <div>
+        <h4>进水点供给上限</h4>
+        <table id="table-capacity-inlets"><thead><tr>
+          <th>进水点</th><th>名称</th><th>供给上限（正整数）</th>
+        </tr></thead><tbody>
+          ${inlets.map((n) => `<tr>
+            <td><b>${esc(n.id)}</b></td>
+            <td>${esc(n.label && n.label !== n.id ? n.label : "")}</td>
+            <td><input data-sup="${esc(n.id)}" type="number" min="1" step="1" value="1"></td>
+          </tr>`).join("")}
+        </tbody></table>
+      </div>
+      <div>
+        <h4>必保供水点需求</h4>
+        <table id="table-capacity-keeps"><thead><tr>
+          <th>必保点</th><th>名称</th><th>需求（正整数）</th>
+        </tr></thead><tbody>
+          ${keeps.map((n) => `<tr>
+            <td><b>${esc(n.id)}</b></td>
+            <td>${esc(n.label && n.label !== n.id ? n.label : "")}</td>
+            <td><input data-dem="${esc(n.id)}" type="number" min="1" step="1" value="1"></td>
+          </tr>`).join("")}
+        </tbody></table>
+      </div>
+    </div>
+    <p>
+      <button id="btn-capacity" type="button" class="primary">容量校核</button>
+      <span class="role-name" id="capacity-hint">未关阀管段 ${openSegs.length} 条 ·
+      进水点 ${inlets.length} 个 · 必保点 ${keeps.length} 个；校核只读</span>
+    </p>
+    <div id="capacity-errors" class="errors hidden"></div>
+    <div id="capacity-result"></div>`;
+  body.appendChild(card);
+
+  card.querySelector("#btn-capacity").addEventListener("click", async () => {
+    const errBox = card.querySelector("#capacity-errors");
+    const resBox = card.querySelector("#capacity-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+    const collect = (attr) => {
+      const out = {};
+      card.querySelectorAll(`input[data-${attr}]`).forEach((inp) => {
+        out[inp.dataset[attr]] = inp.value.trim() === "" ? null : Number(inp.value);
+      });
+      return out;
+    };
+    try {
+      const res = await api("POST", `/api/plans/${r.id}/capacity-check`, {
+        segment_capacities: collect("cap"),
+        inlet_supplies: collect("sup"),
+        keep_demands: collect("dem"),
+      });
+      renderCapacityResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法进行供水容量校核:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+}
+
+function renderCapacityResult(res, box) {
+  const keepRows = (res.node_summary || []).map((ns) => `
+    <tr>
+      <td><b>${esc(ns.node_id)}</b>${
+        ns.label && ns.label !== ns.node_id
+          ? ` <span class="role-name">(${esc(ns.label)})</span>` : ""}
+      </td>
+      <td>${ns.demand}</td>
+      <td>${ns.delivered}</td>
+      <td>${ns.shortage > 0
+        ? `<span class="tag leak_not_isolated">${ns.shortage}</span>`
+        : '<span class="tag supplied">0</span>'}</td>
+    </tr>`).join("");
+  const banner = res.sufficient
+    ? `<div class="banner ok">
+        <span class="big">✓ 容量充足</span>${esc(res.message)}
+        <br><small>总送达量等于总需求, 容量校核通过。本结果为只读校核, 未修改管网与历史方案。</small>
+      </div>`
+    : `<div class="banner bad">
+        <span class="big">✗ 容量不足</span>${esc(res.message)}
+        <br><small>必保点虽全部连通进水点, 但管段容量不足。本结果为只读校核, 未修改管网与历史方案。</small>
+      </div>`;
+  box.innerHTML = `
+    ${banner}
+    <div class="summary">
+      <span>需求总量: <b>${res.total_demand}</b></span>
+      <span>最大送达量: <b>${res.delivered_total}</b></span>
+      <span>总缺口: <b>${res.shortage_total}</b></span>
+      <span>进水点供给上限合计: <b>${res.supply_total}</b></span>
+    </div>
+    <h4>各必保供水点送达情况</h4>
+    <table><thead><tr>
+      <th>必保点</th><th>需求</th><th>实际送达</th><th>缺口</th>
+    </tr></thead><tbody>${keepRows}</tbody></table>
+    <p class="role-name">无向输水网: 未关阀管段 ${res.segment_count} 条（${
+      esc((res.open_segment_ids || []).join(", ")) || "无"}）；
+      总送达量等于总需求才判定容量充足。</p>`;
 }
 
 // ---------- 历史 ----------
