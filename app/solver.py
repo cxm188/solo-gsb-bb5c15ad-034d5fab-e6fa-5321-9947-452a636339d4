@@ -71,6 +71,17 @@ raw_packages): 已保存可行方案的关阀作业备件包采购预览(只读�
 需求/到货/余量; 全部包合起来仍不足时返回逐类缺口; 无关阀备件需求时
 返回零费用空清单。
 
+以及 plan_capacity_check(snapshot, closed_valves, raw_capacities,
+raw_supplies, raw_demands): 已保存可行方案的供水容量校核(只读计算)。
+以方案快照中未关阀管段构成无向输水网, 每条管段录入正整数流量上限
+(管段净流量的绝对值受同一个上限约束, 用两条容量相同的反向有向弧建模),
+每个进水点录入正整数供给上限,每个必保供水点录入正整数需求; 三类录入
+的编号集合都必须与方案快照完整对应(不多不少)。用整数最大流(Dinic)
+求可送达必保点的最大总量, 返回需求总量、最大送达量、总缺口与各必保点
+实际送达量(按必保点编号升序逐个锁定、本点尽可能多送, 结果唯一);
+总送达量等于需求总量才判容量充足, 仅连通但容量不足时返回不足;
+无必保点时返回充足及零需求。
+
 阀门最多 14 个, 枚举全部 2^V 个子集(V<=14 => 16384), 对每个子集做
 BFS 连通性检查即可, 简单且确定。
 """
@@ -2366,5 +2377,244 @@ def plan_spare_parts(snapshot: dict[str, Any],
         "total_demand": total_demand,
         "surplus_total": surplus_total,
         "shortage_total": 0,
+        "message": message,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 供水容量校核(只读计算, 针对已保存的可行方案)
+# ---------------------------------------------------------------------------
+
+def plan_capacity_check(snapshot: dict[str, Any],
+                        closed_valves: list[str],
+                        raw_capacities: Any,
+                        raw_supplies: Any,
+                        raw_demands: Any) -> dict[str, Any]:
+    """已保存可行方案的供水容量校核(只读计算, 不改方案与管网)。
+
+    以方案快照中**未关阀管段**(计划阀门未关闭的管段)构成无向输水网:
+    每条管段录入正整数流量上限(管段净流量的绝对值受同一个上限约束,
+    即无向边容量, 用两条容量相同的反向有向弧建模, 最大流值与无向容量
+    一致), 每个进水点录入正整数供给上限, 每个必保供水点录入正整数需求。
+    三类录入的编号集合都必须与方案快照**完整对应**(未关阀管段 / 进水点 /
+    必保点, 不多不少)。用整数最大流(Dinic)求可送达必保点的最大总量:
+    源->进水点容量=供给上限, 管段=无向容量边, 必保点->汇容量=需求。
+    各必保点实际送达量按必保点编号升序逐个锁定: 前序点送达量锁定后,
+    本点在残余网络上尽可能多送(二分 + 最大流校验), 结果唯一。返回需求
+    总量、最大送达量、总缺口与各必保点实际送达量; 总送达量等于需求总量
+    才判容量充足, 仅连通但容量不足时返回不足; 无必保点时返回充足及
+    零需求。
+    """
+    try:
+        nodes, segments, valves = validate_network(snapshot)
+    except NetworkValidationError as exc:
+        raise NetworkValidationError(
+            ["方案快照数据不合法: " + e for e in exc.errors]) from exc
+
+    errors: list[str] = []
+
+    # ---- 计划关闭阀门必须存在于快照管网中 ----
+    valve_by_id = {vl["id"]: vl for vl in valves}
+    closed = sorted(dict.fromkeys(_norm_id(v) for v in (closed_valves or [])))
+    for vid in closed:
+        if vid not in valve_by_id:
+            errors.append(f"方案关闭的阀门 {vid} 不存在于方案快照的管网中")
+    closed_segments = {valve_by_id[v]["segment_id"] for v in closed
+                       if v in valve_by_id}
+
+    # ---- 未关阀管段构成无向输水网; 进水点供给 / 必保点需求 ----
+    open_segments = [sg for sg in segments if sg["id"] not in closed_segments]
+    open_seg_ids = [sg["id"] for sg in open_segments]
+    open_seg_set = set(open_seg_ids)
+    inlet_ids = sorted(nd["id"] for nd in nodes if nd["role"] == "inlet")
+    inlet_set = set(inlet_ids)
+    keep_ids = sorted(nd["id"] for nd in nodes if nd["role"] == "must_keep")
+    keep_set = set(keep_ids)
+    label_of = {nd["id"]: nd["label"] for nd in nodes}
+
+    # ---- 管段流量上限: 键恰好是全部未关阀管段, 值为正整数 ----
+    if not isinstance(raw_capacities, dict):
+        errors.append("capacities 必须是以管段编号为键的对象")
+        raw_cap: dict[str, Any] = {}
+    else:
+        raw_cap = raw_capacities
+    capacities: dict[str, int] = {}
+    missing_c = [sid for sid in open_seg_ids if sid not in raw_cap]
+    extra_c = sorted(str(k) for k in raw_cap if k not in open_seg_set)
+    if missing_c:
+        errors.append("缺少未关阀管段的流量上限: " + ", ".join(missing_c))
+    if extra_c:
+        errors.append("提供了非未关阀管段的流量上限(多余编号): "
+                      + ", ".join(extra_c))
+    for sid in open_seg_ids:
+        if sid in raw_cap:
+            val = _positive_int(raw_cap[sid])
+            if val is None:
+                errors.append(f"管段 {sid} 的流量上限必须是正整数, "
+                              f"收到: {raw_cap[sid]!r}")
+            else:
+                capacities[sid] = val
+
+    # ---- 进水点供给上限: 键恰好是全部进水点, 值为正整数 ----
+    if not isinstance(raw_supplies, dict):
+        errors.append("supplies 必须是以进水点编号为键的对象")
+        raw_sup: dict[str, Any] = {}
+    else:
+        raw_sup = raw_supplies
+    supplies: dict[str, int] = {}
+    missing_s = [iid for iid in inlet_ids if iid not in raw_sup]
+    extra_s = sorted(str(k) for k in raw_sup if k not in inlet_set)
+    if missing_s:
+        errors.append("缺少进水点的供给上限: " + ", ".join(missing_s))
+    if extra_s:
+        errors.append("提供了非进水点的供给上限(多余编号): "
+                      + ", ".join(extra_s))
+    for iid in inlet_ids:
+        if iid in raw_sup:
+            val = _positive_int(raw_sup[iid])
+            if val is None:
+                errors.append(f"进水点 {iid} 的供给上限必须是正整数, "
+                              f"收到: {raw_sup[iid]!r}")
+            else:
+                supplies[iid] = val
+
+    # ---- 必保点需求: 键恰好是全部必保供水点, 值为正整数 ----
+    if not isinstance(raw_demands, dict):
+        errors.append("demands 必须是以必保供水点编号为键的对象")
+        raw_dem: dict[str, Any] = {}
+    else:
+        raw_dem = raw_demands
+    demands: dict[str, int] = {}
+    missing_d = [kid for kid in keep_ids if kid not in raw_dem]
+    extra_d = sorted(str(k) for k in raw_dem if k not in keep_set)
+    if missing_d:
+        errors.append("缺少必保供水点的需求: " + ", ".join(missing_d))
+    if extra_d:
+        errors.append("提供了非必保供水点的需求(多余编号): "
+                      + ", ".join(extra_d))
+    for kid in keep_ids:
+        if kid in raw_dem:
+            val = _positive_int(raw_dem[kid])
+            if val is None:
+                errors.append(f"必保点 {kid} 的需求必须是正整数, "
+                              f"收到: {raw_dem[kid]!r}")
+            else:
+                demands[kid] = val
+
+    if errors:
+        raise NetworkValidationError(errors)
+
+    open_segment_rows = [{
+        "id": sg["id"], "endpoint_a": sg["endpoint_a"],
+        "endpoint_b": sg["endpoint_b"], "capacity": capacities[sg["id"]],
+    } for sg in open_segments]
+    inlet_rows = [{"id": iid, "label": label_of[iid], "supply": supplies[iid]}
+                  for iid in inlet_ids]
+
+    # ---- 无必保点: 直接判充足, 零需求 ----
+    if not keep_ids:
+        return {
+            "ok": True,
+            "sufficient": True,
+            "empty": True,
+            "closed_valves": closed,
+            "open_segments": open_segment_rows,
+            "open_segment_ids": open_seg_ids,
+            "capacities": capacities,
+            "inlets": inlet_rows,
+            "supplies": supplies,
+            "keep_nodes": [],
+            "demands": {},
+            "node_summary": [],
+            "total_demand": 0,
+            "delivered_total": 0,
+            "shortage_total": 0,
+            "message": ("供水容量校核(只读, 不修改管网与历史方案): 方案快照"
+                        "中没有必保供水点, 需求总量为 0, 直接判定容量充足。"),
+        }
+
+    # ---- 整数最大流: 源->进水点(供给上限), 管段=无向容量边(两条反向弧,
+    #      净流量绝对值不超过同一上限), 必保点->汇(需求) ----
+    n = len(nodes)
+    idx = {nd["id"]: i + 1 for i, nd in enumerate(nodes)}
+    sink = n + 1
+    size = n + 2
+
+    def build_caps(need: dict[str, int]) -> list[list[int]]:
+        caps = [[0] * size for _ in range(size)]
+        for iid in inlet_ids:
+            caps[0][idx[iid]] = supplies[iid]
+        for sg in open_segments:
+            c = capacities[sg["id"]]
+            u, v = idx[sg["endpoint_a"]], idx[sg["endpoint_b"]]
+            caps[u][v] += c
+            caps[v][u] += c
+        for kid in keep_ids:
+            caps[idx[kid]][sink] = need[kid]
+        return caps
+
+    total_demand = sum(demands[kid] for kid in keep_ids)
+    delivered_total = _dinic_maxflow(build_caps(demands), 0, sink)
+
+    # ---- 各必保点实际送达量: 编号升序逐个锁定, 前序点锁定后本点尽可能
+    #      多送(测试本点上界时把后续点的汇边容量置 0, 前序+本点目标全部
+    #      可完成当且仅当最大流恰好等于其和), 结果唯一 ----
+    if delivered_total >= total_demand:
+        targets = {kid: demands[kid] for kid in keep_ids}
+    else:
+        targets = {}
+        for kid in keep_ids:
+            lo, hi = 0, demands[kid]
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                need = {k2: 0 for k2 in keep_ids}
+                need.update(targets)
+                need[kid] = mid
+                locked_sum = sum(targets.values()) + mid
+                if _dinic_maxflow(build_caps(need), 0, sink) == locked_sum:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            targets[kid] = lo
+
+    shortage_total = total_demand - delivered_total
+    sufficient = shortage_total == 0
+    node_summary = [{
+        "node_id": kid, "label": label_of[kid],
+        "demand": demands[kid], "delivered": targets[kid],
+        "shortage": demands[kid] - targets[kid],
+    } for kid in keep_ids]
+    keep_nodes = [{"id": kid, "label": label_of[kid], "demand": demands[kid]}
+                  for kid in keep_ids]
+
+    if sufficient:
+        message = (
+            f"供水容量校核(只读, 不修改管网与历史方案): 未关阀管段输水网"
+            f"可送达必保点的最大总量 {delivered_total}, 等于需求总量 "
+            f"{total_demand}, 全部 {len(keep_ids)} 个必保点需求均可满足, "
+            f"容量充足。")
+    else:
+        message = (
+            f"供水容量校核(只读, 不修改管网与历史方案): 必保点需求总量 "
+            f"{total_demand}, 但未关阀管段输水网最大送达量仅 "
+            f"{delivered_total}, 总缺口 {shortage_total}; 连通不代表容量"
+            f"足够, 按容量校核判定为不足, 各必保点缺口已列出。")
+
+    return {
+        "ok": True,
+        "sufficient": sufficient,
+        "empty": False,
+        "closed_valves": closed,
+        "open_segments": open_segment_rows,
+        "open_segment_ids": open_seg_ids,
+        "capacities": capacities,
+        "inlets": inlet_rows,
+        "supplies": supplies,
+        "keep_nodes": keep_nodes,
+        "demands": demands,
+        "node_summary": node_summary,
+        "total_demand": total_demand,
+        "delivered_total": delivered_total,
+        "shortage_total": shortage_total,
         "message": message,
     }

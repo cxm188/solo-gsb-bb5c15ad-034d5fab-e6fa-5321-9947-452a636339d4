@@ -338,6 +338,7 @@ function renderResult(r) {
     appendMonitorPanel(r);
     appendWaterDeliveryPanel(r);
     appendSparePartsPanel(r);
+    appendCapacityPanel(r);
     drawCanvas();
     return;
   }
@@ -367,6 +368,7 @@ function renderResult(r) {
   appendMonitorPanel(r);
   appendWaterDeliveryPanel(r);
   appendSparePartsPanel(r);
+  appendCapacityPanel(r);
   drawCanvas();
 }
 
@@ -1548,6 +1550,145 @@ function renderSparePartsResult(res, box) {
     <p class="role-name">合计: 需求 ${res.total_demand} 件, 到货
     ${res.arrived_total} 件, 余量 <b>${res.surplus_total}</b> 件,
     总价 <b>${res.total_cost}</b>。</p>`;
+}
+
+// ---------- 供水容量校核 ----------
+// 入口: 可行方案详情(历史方案"查看"或刚求解出的方案)下方的校核卡片。
+// 只读计算, 不修改管网与历史方案。
+function appendCapacityPanel(r) {
+  if (r.id == null) return; // 未入库结果不提供校核入口
+  const body = $("#result-body");
+  const card = document.createElement("div");
+  card.className = "card";
+  card.id = "capacity-card";
+
+  // 无向输水网 = 方案快照中未关阀管段(状态非"已关阀"的全部管段)
+  const openSegs = (r.segment_status || []).filter((s) => s.status !== "closed");
+  const inlets = (r.node_status || []).filter((n) => n.role === "inlet");
+  const keeps = (r.node_status || []).filter((n) => n.role === "must_keep");
+
+  if (!keeps.length) {
+    card.innerHTML = `
+      <h3>供水容量校核</h3>
+      <p class="role-name">方案快照中没有必保供水点, 需求总量为 0, 容量校核直接判定充足。</p>`;
+    body.appendChild(card);
+    return;
+  }
+
+  card.innerHTML = `
+    <h3>供水容量校核 <span class="role-name">(只读计算, 不修改管网与历史方案)</span></h3>
+    <p class="role-name">
+      以方案快照中<b>未关阀管段</b>构成无向输水网: 为每条管段填<b>正整数流量上限</b>
+      (管段净流量的绝对值受同一个上限约束), 为每个进水点填<b>正整数供给上限</b>,
+      为每个必保供水点填<b>正整数需求</b>; 三类编号须与方案快照完整对应。
+      系统用整数最大流求可送达必保点的最大总量; 总送达量等于需求总量才判定
+      <b>容量充足</b>, 仅连通但容量不足会显示不足与各点缺口。
+    </p>
+    <div class="grid-two">
+      <div>
+        <h4>未关阀管段流量上限（正整数）</h4>
+        <table id="table-capacity-segs"><thead><tr>
+          <th>管段</th><th>端点</th><th>流量上限</th>
+        </tr></thead><tbody>
+          ${openSegs.map((s) => `<tr>
+            <td><b>${esc(s.id)}</b></td>
+            <td>${esc(s.endpoint_a)} — ${esc(s.endpoint_b)}</td>
+            <td><input data-cap="${esc(s.id)}" type="number" min="1" step="1" value="1"></td>
+          </tr>`).join("")}
+        </tbody></table>
+      </div>
+      <div>
+        <h4>进水点供给上限（正整数）</h4>
+        <table id="table-capacity-supplies"><thead><tr>
+          <th>进水点</th><th>名称</th><th>供给上限</th>
+        </tr></thead><tbody>
+          ${inlets.map((n) => `<tr>
+            <td><b>${esc(n.id)}</b></td>
+            <td>${esc(n.label || n.id)}</td>
+            <td><input data-sup="${esc(n.id)}" type="number" min="1" step="1" value="1"></td>
+          </tr>`).join("")}
+        </tbody></table>
+        <h4>必保供水点需求（正整数）</h4>
+        <table id="table-capacity-demands"><thead><tr>
+          <th>必保点</th><th>名称</th><th>需求</th>
+        </tr></thead><tbody>
+          ${keeps.map((n) => `<tr>
+            <td><b>${esc(n.id)}</b></td>
+            <td>${esc(n.label || n.id)}</td>
+            <td><input data-dem="${esc(n.id)}" type="number" min="1" step="1" value="1"></td>
+          </tr>`).join("")}
+        </tbody></table>
+      </div>
+    </div>
+    <p>
+      <button id="btn-capacity" type="button" class="primary">供水容量校核</button>
+      <span class="role-name">未关阀管段 ${openSegs.length} 条 / 进水点 ${inlets.length} 个 / 必保点 ${keeps.length} 个, 编号须与方案快照完整对应; 校核只读</span>
+    </p>
+    <div id="capacity-errors" class="errors hidden"></div>
+    <div id="capacity-result"></div>`;
+  body.appendChild(card);
+
+  card.querySelector("#btn-capacity").addEventListener("click", async () => {
+    const errBox = card.querySelector("#capacity-errors");
+    const resBox = card.querySelector("#capacity-result");
+    errBox.classList.add("hidden");
+    resBox.innerHTML = "";
+    const collect = (attr) => {
+      const out = {};
+      card.querySelectorAll(`input[data-${attr}]`).forEach((inp) => {
+        out[inp.dataset[attr]] = inp.value.trim() === "" ? null : Number(inp.value);
+      });
+      return out;
+    };
+    try {
+      const res = await api("POST", `/api/plans/${r.id}/capacity-check`, {
+        capacities: collect("cap"),
+        supplies: collect("sup"),
+        demands: collect("dem"),
+      });
+      renderCapacityResult(res, resBox);
+    } catch (err) {
+      errBox.innerHTML = `<b>无法进行供水容量校核:</b><ul>${
+        String(err.message).split("\n").map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`;
+      errBox.classList.remove("hidden");
+    }
+  });
+}
+
+function renderCapacityResult(res, box) {
+  const nodeRows = (res.node_summary || []).map((ns) => `
+    <tr>
+      <td><b>${esc(ns.node_id)}</b>${
+        ns.label && ns.label !== ns.node_id ? ` <span class="role-name">(${esc(ns.label)})</span>` : ""}
+      </td>
+      <td>${ns.demand}</td>
+      <td>${ns.delivered}</td>
+      <td>${ns.shortage > 0
+        ? `<span class="tag leak_not_isolated">${ns.shortage}</span>`
+        : '<span class="tag supplied">0</span>'}</td>
+    </tr>`).join("");
+
+  const banner = res.sufficient
+    ? `<div class="banner ok">
+        <span class="big">✓ 容量充足</span>${esc(res.message)}
+        <br><small>最大送达量等于需求总量。本结果为只读校核, 未修改管网与历史方案。</small>
+      </div>`
+    : `<div class="banner bad">
+        <span class="big">✗ 容量不足</span>${esc(res.message)}
+        <br><small>仅连通不代表容量足够。本结果为只读校核, 未修改管网与历史方案。</small>
+      </div>`;
+
+  box.innerHTML = `
+    ${banner}
+    <div class="summary">
+      <span>需求总量: <b>${res.total_demand}</b></span>
+      <span>最大送达量: <b>${res.delivered_total}</b></span>
+      <span>总缺口: <b>${res.shortage_total}</b></span>
+    </div>
+    <h4>各必保点实际送达量（按必保点编号升序逐个最大化, 结果唯一）</h4>
+    <table><thead><tr>
+      <th>必保点</th><th>需求</th><th>实际送达量</th><th>缺口</th>
+    </tr></thead><tbody>${nodeRows}</tbody></table>`;
 }
 
 // ---------- 历史 ----------
